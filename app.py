@@ -1,17 +1,26 @@
-"""Responsive Calculator App with Basic and Scientific Functions."""
+"""Responsive Standard + Scientific calculator built with Streamlit.
 
-from datetime import datetime
+Works with the existing calculator.py (AST based evaluator). Only this file
+changed: calculator.py, requirements.txt and README.md are used as they are.
+"""
+
+from __future__ import annotations
+
 import csv
+import html
+import inspect
 import io
 import re
+from datetime import datetime
 
 import streamlit as st
-from calculator import CalculatorError, evaluate_expression, format_result
 
-
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+from calculator import (
+    MAX_EXPRESSION_LENGTH,
+    CalculatorError,
+    evaluate_expression,
+    format_result,
+)
 
 st.set_page_config(
     page_title="Calculator",
@@ -25,1264 +34,553 @@ st.set_page_config(
 # SESSION STATE
 # --------------------------------------------------
 
+def _system_prefers_dark() -> bool:
+    """Start in the visitor's own theme when Streamlit can tell us."""
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
+
+
 DEFAULTS = {
-    "expression": "",
+    "expression": "",        # text in the display (typed or built with the keypad)
     "history": [],
-    "last_result": None,
-    "last_error": "",
+    "ans": None,             # previous result, used by the Ans key
+    "last_expression": "",   # small line above the display, e.g. "2 + 3 ="
+    "notice": None,          # ("error" | "warning", message)
     "just_evaluated": False,
-    "appearance": "Light",
 }
-
-for key, value in DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-# Supported scientific functions and constants
-ALLOWED_NAMES = {
-    "sqrt", "sin", "cos", "tan",
-    "log", "ln", "abs", "pi", "e"
-}
-
-ALLOWED_OPERATORS = {
-    "+", "-", "*", "/", "%", "**"
-}
+for _key, _value in DEFAULTS.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _value
+if "dark" not in st.session_state:
+    st.session_state["dark"] = _system_prefers_dark()
 
 
-# --------------------------------------------------
-# INPUT VALIDATION
-# --------------------------------------------------
+def _stretch(widget) -> dict:
+    """Full-width kwargs that work on old and new Streamlit versions."""
+    try:
+        params = inspect.signature(widget).parameters
+    except (TypeError, ValueError):
+        params = {}
+    return {"width": "stretch"} if "width" in params else {"use_container_width": True}
 
-def sanitize_expression():
-    """Allow numbers, operators and supported scientific functions."""
 
-    raw = st.session_state.expression
-
-    # Remove unsupported symbols
-    cleaned = re.sub(
-        r"[^0-9A-Za-z+\-*/().%\s]",
-        "",
-        raw
-    )
-
-    # Remove unsupported words but retain valid functions
-    # cleaned = re.sub(
-    #     r"[A-Za-z]+",
-    #     lambda match: (
-    #         match.group(0)
-    #         if match.group(0) in ALLOWED_NAMES
-    #         else ""
-    #     ),
-    #     cleaned
-    # )
-
-    # Update only if input actually changed.
-    # This helps prevent unnecessary cursor repositioning.
-    if cleaned != raw:
-        st.session_state.expression = cleaned
+STRETCH_SUBMIT = _stretch(st.form_submit_button)
+STRETCH_BUTTON = _stretch(st.button)
+STRETCH_DOWNLOAD = _stretch(st.download_button)
 
 
 # --------------------------------------------------
-# CALCULATOR FUNCTIONS
+# INPUT CLEANING AND EVALUATION
 # --------------------------------------------------
 
-def add_token(token: str):
-    """Add a number, operator or scientific function."""
+# Names that calculator.py understands, plus "ans" (resolved in this file).
+ALLOWED_NAMES = {"sqrt", "abs", "round", "sin", "cos", "tan", "log", "ln", "pi", "e", "ans"}
 
-    if st.session_state.just_evaluated:
-
-        if token not in ALLOWED_OPERATORS:
-            st.session_state.expression = ""
-
-    st.session_state.expression += token
-
-    st.session_state.just_evaluated = False
-    st.session_state.last_error = ""
-
-
-def clear_all():
-    """Clear calculator display."""
-
-    st.session_state.expression = ""
-    st.session_state.last_result = None
-    st.session_state.last_error = ""
-    st.session_state.just_evaluated = False
+_SYMBOLS = str.maketrans({"×": "*", "÷": "/", "−": "-", "–": "-", "—": "-", "π": "pi"})
+_TOKEN_RE = re.compile(
+    r"""
+      (?P<space>\s+)
+    | (?P<num>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
+    | (?P<name>[A-Za-z]+)
+    | (?P<sym>\*\*|//|[-+*/^%(),.])
+    """,
+    re.VERBOSE,
+)
 
 
-def backspace():
-    """Delete the last character."""
+def clean_expression(text: str) -> tuple[str, list[str]]:
+    """Keep numbers, operators, brackets and supported names; report the rest."""
+    text = text.translate(_SYMBOLS)
+    kept: list[str] = []
+    removed: list[str] = []
+    pos = 0
+    while pos < len(text):
+        match = _TOKEN_RE.match(text, pos)
+        if match is None:
+            removed.append(text[pos])
+            pos += 1
+            continue
+        pos = match.end()
+        token = match.group()
+        if match.lastgroup == "name" and token.lower() not in ALLOWED_NAMES:
+            removed.append(token)
+        else:
+            kept.append(token.lower() if match.lastgroup == "name" else token)
+    return "".join(kept).strip(), list(dict.fromkeys(removed))
 
-    st.session_state.expression = (
-        st.session_state.expression[:-1]
-    )
 
-    st.session_state.last_error = ""
-    st.session_state.just_evaluated = False
+def prettify(expression: str) -> str:
+    """Show an expression the way a calculator display would."""
+    out = expression.replace("**", "^").replace("*", "×").replace("/", "÷")
+    out = out.replace("××", "^").replace("÷÷", "//")
+    out = re.sub(r"(?<!\de)-", "−", out)
+    return re.sub(r"(?<![A-Za-z])pi(?![A-Za-z])", "π", out)
 
 
-def wrap_sqrt():
-    """Insert square root function."""
+def plain(value) -> str:
+    """Result as text that can be typed back into the display (no commas)."""
+    return format_result(value).replace(",", "")
 
-    current = st.session_state.expression.strip()
 
-    if current:
-        st.session_state.expression = f"sqrt({current})"
+def evaluate(cleaned: str):
+    """Resolve Ans, ^ and open brackets, then use calculator.py."""
+    text = cleaned.replace("^", "**")
+    if re.search(r"(?<![A-Za-z])ans(?![A-Za-z])", text):
+        if st.session_state.ans is None:
+            raise CalculatorError("There is no previous answer yet.")
+        text = re.sub(r"(?<![A-Za-z])ans(?![A-Za-z])", f"({plain(st.session_state.ans)})", text)
+    depth = text.count("(") - text.count(")")
+    if depth < 0:
+        raise CalculatorError("Unmatched ')'.")
+    return evaluate_expression(text + ")" * depth)
+
+
+# --------------------------------------------------
+# KEYPAD LOGIC
+# --------------------------------------------------
+
+OPS = "+-*/^×÷−%"            # single-character binary operators
+OP_TOKENS = set(OPS) | {"//"}
+MINUS = "-−"
+HIGH_OPS = "*/^×÷%"           # operators after which a minus is a sign, e.g. 5×-3
+FUNC_TOKENS = {"sin(", "cos(", "tan(", "log(", "ln(", "sqrt(", "abs(", "round("}
+POSTFIX = {"SQ": "^2"}
+CONTINUE_TOKENS = OP_TOKENS | set(POSTFIX)
+CONSTANT_TOKENS = {"pi", "e", "ans"}
+
+
+def press(token: str) -> None:
+    """Handle one calculator key the way a real calculator would."""
+    s = st.session_state
+    s.notice = None
+    expr = s.expression
+
+    if s.just_evaluated:
+        s.just_evaluated = False
+        if token in CONTINUE_TOKENS:
+            pass                                   # keep going from the result
+        elif token in FUNC_TOKENS:
+            s.expression = f"{token}{expr})"       # apply the function to the result
+            return
+        elif token in (")", ","):
+            s.just_evaluated = True                # nothing to close / separate
+            return
+        else:
+            expr = ""                              # digit, "(", constant: start fresh
+
+    last = expr[-1] if expr else ""
+
+    if token.isdigit():
+        segment = re.search(r"\d*\.?\d*$", expr).group()
+        if segment == "0":
+            expr = expr[:-1] + token               # 0 then 5 -> 5, not 05
+        else:
+            expr += token
+
+    elif token == ".":
+        segment = re.search(r"\d*\.?\d*$", expr).group()
+        if "." in segment:
+            return                                 # one decimal point per number
+        if segment:
+            expr += "."
+        elif last == ")" or last.isalpha():
+            expr += "×0."
+        else:
+            expr += "0."
+
+    elif token in OP_TOKENS:
+        if not expr or last in "(,":
+            if token in MINUS:
+                expr += token                      # leading minus is a sign
+        elif last in OPS:
+            if token in MINUS and last in HIGH_OPS:
+                expr += token                      # 5×-3
+            else:                                  # changed your mind: replace operator
+                base = expr.rstrip(OPS)
+                if base:
+                    expr = base + token
+                elif token in MINUS:
+                    expr = token
+        else:
+            expr += token
+
+    elif token in POSTFIX:
+        if expr and last not in OPS and last not in "(,":
+            expr += POSTFIX[token]
+
+    elif token == ",":
+        if expr and last not in OPS and last not in "(,":
+            expr += token
+
+    elif token == "(":
+        expr += token
+
+    elif token == ")":
+        opened = expr.count("(") - expr.count(")")
+        if opened > 0 and last not in OPS and last not in "(,":
+            expr += token
+
+    elif token in FUNC_TOKENS or token in CONSTANT_TOKENS:
+        expr += token
+
+    if len(expr) <= MAX_EXPRESSION_LENGTH:
+        s.expression = expr
+
+
+def backspace() -> None:
+    s = st.session_state
+    s.notice = None
+    s.just_evaluated = False
+    # Remove "sin(", "pi", "ans" as one unit, otherwise a single character.
+    match = re.search(r"(?:[a-z]+\(|ans|pi)$", s.expression)
+    s.expression = s.expression[: match.start()] if match else s.expression[:-1]
+
+
+def clear_all() -> None:
+    s = st.session_state
+    s.expression = ""
+    s.last_expression = ""
+    s.notice = None
+    s.just_evaluated = False
+
+
+def on_key(token: str) -> None:
+    if token == "AC":
+        clear_all()
+    elif token == "BACK":
+        backspace()
     else:
-        st.session_state.expression = "sqrt("
-
-    st.session_state.just_evaluated = False
-    st.session_state.last_error = ""
+        press(token)
 
 
-def square_expression():
-    """Square the current expression."""
+def run_calculation() -> None:
+    """Runs on the = key and on the Enter key."""
+    s = st.session_state
+    if not s.expression.strip():
+        return
 
-    current = st.session_state.expression.strip()
-
-    if current:
-        st.session_state.expression = f"({current})**2"
-
-    st.session_state.just_evaluated = False
-    st.session_state.last_error = ""
-
-
-def insert_answer():
-    """Insert the previous calculation result."""
-
-    if st.session_state.last_result is not None:
-
-        add_token(str(st.session_state.last_result))
-
-    else:
-        st.session_state.last_error = (
-            "There is no previous answer yet."
+    cleaned, removed = clean_expression(s.expression)
+    if removed:
+        s.expression = cleaned
+        s.just_evaluated = False
+        s.notice = (
+            "warning",
+            "Removed unsupported input: " + ", ".join(f"'{r}'" for r in removed)
+            + ". Only numbers, operators and the listed functions are allowed.",
         )
-
-
-# --------------------------------------------------
-# CALCULATION
-# --------------------------------------------------
-
-def run_calculation():
-
-    expression = st.session_state.expression.strip()
+        return
 
     try:
-
-        if not expression:
-            raise CalculatorError(
-                "Enter an expression first."
-            )
-
-        result = evaluate_expression(expression)
-
-        result_text = format_result(result)
-
-        st.session_state.last_result = result
-        st.session_state.last_error = ""
-
-        # Save calculation history
-        st.session_state.history.insert(
-            0,
-            {
-                "time": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "expression": expression,
-                "result": result_text,
-            }
-        )
-
-        # Keep only the latest 100 calculations
-        st.session_state.history = (
-            st.session_state.history[:100]
-        )
-
-        st.session_state.expression = str(result)
-
-        st.session_state.just_evaluated = True
-
+        value = evaluate(cleaned)
     except CalculatorError as exc:
-
-        st.session_state.last_error = str(exc)
-        st.session_state.last_result = None
-        st.session_state.just_evaluated = False
-
+        s.notice = ("error", str(exc))
+        s.just_evaluated = False
+        return
     except Exception:
+        s.notice = ("error", "Unable to calculate this expression.")
+        s.just_evaluated = False
+        return
 
-        st.session_state.last_error = (
-            "Unable to calculate this expression."
-        )
+    s.history.insert(0, {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "expression": prettify(cleaned),
+        "raw": cleaned,
+        "result": format_result(value),
+    })
+    s.history = s.history[:100]
+    s.ans = value
+    s.last_expression = prettify(cleaned) + " ="
+    s.expression = plain(value)
+    s.just_evaluated = True
+    s.notice = None
 
-        st.session_state.last_result = None
-        st.session_state.just_evaluated = False
+
+def load_history(index: int) -> None:
+    s = st.session_state
+    s.expression = s.history[index]["raw"]
+    s.just_evaluated = False
+    s.notice = None
 
 
-def clear_history():
+def clear_history() -> None:
     st.session_state.history = []
 
 
-# --------------------------------------------------
-# APPEARANCE SELECTOR
-# --------------------------------------------------
-
-head_left, head_right = st.columns([3, 1])
-
-with head_left:
-
-    st.markdown(
-        '<div class="calc-title", font-size: 40px'
-        '>🧮 Calculator</div>',
-        unsafe_allow_html=True
-    )
-    
-
-    st.markdown(
-        '<div class="calc-subtitle">'
-        'Standard • Scientific Calculator'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with head_right:
-    st.selectbox(
-        "Appearance",
-        options=["Light", "Dark"],
-        key="appearance",
-        label_visibility="collapsed"
-    )
-
-
-    # st.selectbox(
-    #     "Appearance",
-    #     ["Light", "Dark"],
-    #     key="appearance",
-    #     label_visibility="collapsed",
-    #     help="Choose calculator appearance"
-    # )
+def live_preview() -> str:
+    """Result shown while typing, like phone calculators do."""
+    s = st.session_state
+    if not s.expression.strip() or s.just_evaluated:
+        return ""
+    cleaned, removed = clean_expression(s.expression)
+    if removed:
+        return ""
+    try:
+        value = evaluate(cleaned)
+    except Exception:
+        return ""
+    text = plain(value)
+    return "" if text == cleaned.replace(" ", "") else f"= {format_result(value)}"
 
 
 # --------------------------------------------------
-# THEME COLORS
+# THEME
 # --------------------------------------------------
 
-dark = st.session_state.appearance == "Dark"
-if dark:
-    page_bg = "#111827"
-    panel_bg = "#1f2937"
-    text_color = "#f9fafb"
-    muted_color = "#aab4c3"
-    input_bg = "#111827"
-    button_bg = "#374151"
-    border_color = "#374151"
-
+if st.session_state.dark:
+    palette = {
+        "scheme": "dark", "bg": "#0f172a", "panel": "#1e293b",
+        "text": "#f1f5f9", "muted": "#94a3b8", "input": "#0f172a",
+        "key": "#334155", "key_fn": "#475569", "border": "#475569",
+        "accent": "#60a5fa", "equals": "#2563eb",
+    }
 else:
-    page_bg = "#f7f8fc"
-    panel_bg = "#ffffff"
-    text_color = "#172033"
-    muted_color = "#7b8494"
-    input_bg = "#ffffff"
-    button_bg = "#ffffff"
-    border_color = "#e2e6ef"
-
-
-# --------------------------------------------------
-# APPLY THEME CSS
-# --------------------------------------------------
+    palette = {
+        "scheme": "light", "bg": "#f4f6fb", "panel": "#ffffff",
+        "text": "#111827", "muted": "#6b7280", "input": "#ffffff",
+        "key": "#ffffff", "key_fn": "#e5e7eb", "border": "#d1d5db",
+        "accent": "#2563eb", "equals": "#2563eb",
+    }
 
 st.markdown(
     f"""
-    <style>
-
-    /* Main application background */
-
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stMain"] {{
-        background: {page_bg} !important;
-        color: {text_color} !important;
-    }}
-
-    /* Main content */
-    
-
-    [data-testid="stMainBlockContainer"] {{
-        background: {page_bg} !important;
-    }}
-
-    /* Header */
-
-    [data-testid="stHeader"] {{
-        background: {page_bg} !important;
-    }}
-
-    /* Calculator panel */
-    /* Calculator Title */
-.stApp .calc-title {{
-    font-size: 60px !important;
-    font-weight: 800 !important;
-    line-height: 1.3 !important;
-    text-align: left !important;
-    color: {text_color} !important;
-    margin-bottom: 5px !important;
+<style>
+:root {{
+  color-scheme: {palette['scheme']};
+  --bg: {palette['bg']};       --panel: {palette['panel']};
+  --text: {palette['text']};   --muted: {palette['muted']};
+  --input: {palette['input']}; --key: {palette['key']};
+  --key-fn: {palette['key_fn']}; --border: {palette['border']};
+  --accent: {palette['accent']}; --equals: {palette['equals']};
 }}
 
-    # [data-testid="stVerticalBlockBorderWrapper"] {{
-    #     background: {panel_bg} !important;
-    #     border: 1px solid {border_color} !important;
-    #     border-radius: 18px !important;
-    # }}
+/* ---------- page ---------- */
+html, body, .stApp,
+[data-testid="stAppViewContainer"], [data-testid="stMain"],
+[data-testid="stHeader"] {{ background: var(--bg) !important; }}
+[data-testid="stHeader"] {{ color: var(--text) !important; }}
+.stApp, .stApp p, .stApp label, .stApp li,
+.stApp h1, .stApp h2, .stApp h3 {{ color: var(--text); }}
+.block-container {{ max-width: 600px; padding: 2rem 1rem 3rem; }}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] * {{ color: var(--muted) !important; }}
 
-    /* All normal text */
+/* ---------- heading ---------- */
+.calc-title {{ font-size: clamp(1.7rem, 6vw, 2.4rem); font-weight: 800;
+               line-height: 1.15; color: var(--text); }}
+.calc-subtitle {{ color: var(--muted); font-size: .9rem; margin-top: .15rem; }}
 
-    .stApp p,
-    .stApp label,
-    .stApp span,
-    .stApp h1,
-    .stApp h2,
-    .stApp h3,
-    .stApp .stMarkdown {{
-        color: {text_color};
-    }}
+/* ---------- display panel ---------- */
+.st-key-display_panel {{ background: var(--panel); border: 1px solid var(--border);
+  border-radius: 18px; padding: 1rem 1rem .75rem; margin-bottom: .5rem; }}
+.calc-prev {{ text-align: right; color: var(--muted); font-size: .95rem;
+              min-height: 1.4rem; overflow-wrap: anywhere; }}
+.calc-preview {{ text-align: right; color: var(--muted); font-size: 1.05rem;
+                 min-height: 1.6rem; margin-top: .35rem; overflow-wrap: anywhere; }}
 
-    /* Secondary text */
+[data-testid="stTextInput"] div[data-baseweb="input"],
+[data-testid="stTextInput"] div[data-baseweb="base-input"],
+[data-testid="stTextInput"] input {{
+  background: var(--input) !important; color: var(--text) !important; }}
+[data-testid="stTextInput"] div[data-baseweb="input"] {{
+  border: 1px solid var(--border) !important; border-radius: 14px !important; }}
+[data-testid="stTextInput"] div[data-baseweb="input"]:focus-within {{
+  border-color: var(--accent) !important; box-shadow: 0 0 0 1px var(--accent) !important; }}
+[data-testid="stTextInput"] input {{
+  text-align: right; font-size: clamp(1.3rem, 5vw, 1.8rem); font-weight: 600;
+  font-variant-numeric: tabular-nums; min-height: 3.2rem;
+  caret-color: var(--accent); }}
+[data-testid="stTextInput"] input::placeholder {{ color: var(--muted); opacity: 1; }}
+[data-testid="InputInstructions"] {{ display: none !important; }}
 
-    [data-testid="stCaptionContainer"] {{
-        color: {muted_color} !important;
-    }}
+/* ---------- forms ---------- */
+[data-testid="stForm"] {{ border: 0 !important; padding: 0 !important;
+                          background: transparent !important; }}
 
-    /* Calculator input */
+/* ---------- keys ---------- */
+[data-testid="stButton"] button,
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stDownloadButton"] button {{
+  background: var(--key) !important; color: var(--text) !important;
+  border: 1px solid var(--border) !important; border-radius: 13px !important;
+  min-height: 3.2rem; font-weight: 650; }}
+[data-testid="stButton"] button p,
+[data-testid="stFormSubmitButton"] button p,
+[data-testid="stDownloadButton"] button p {{ color: inherit !important; font-size: 1.05rem; }}
+[data-testid="stButton"] button:hover,
+[data-testid="stFormSubmitButton"] button:hover,
+[data-testid="stDownloadButton"] button:hover {{
+  border-color: var(--accent) !important; color: var(--accent) !important; }}
+[class*="st-key-fn_"] button, [class*="st-key-sci_"] button {{
+  background: var(--key-fn) !important; }}
+[class*="st-key-op_"] button {{ color: var(--accent) !important; font-weight: 800; }}
+[class*="st-key-hist_"] button {{ min-height: 2.5rem; font-weight: 500;
+  justify-content: flex-start; text-align: left; }}
+button[kind="primaryFormSubmit"], button[data-testid="stBaseButton-primaryFormSubmit"],
+button[kind="primary"] {{
+  background: var(--equals) !important; border-color: var(--equals) !important;
+  color: #ffffff !important; }}
+button[kind="primaryFormSubmit"]:hover,
+button[data-testid="stBaseButton-primaryFormSubmit"]:hover {{
+  color: #ffffff !important; filter: brightness(1.1); }}
 
-    [data-testid="stTextInput"] input {{
-        background: {input_bg} !important;
-        color: {text_color} !important;
-        border: 1px solid {border_color} !important;
-        border-radius: 14px !important;
-        caret-color: #3b82f6 !important;
-        text-align: right !important;
-        font-size: 1.6rem !important;
-        font-weight: 600 !important;
-    }}
+/* ---------- expanders ---------- */
+[data-testid="stExpander"] {{ border: 0 !important; background: transparent !important; }}
+[data-testid="stExpander"] details {{ background: var(--panel) !important;
+  border: 1px solid var(--border) !important; border-radius: 12px !important; }}
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * {{
+  color: var(--text) !important; }}
 
-    [data-testid="stTextInput"] input:focus {{
-        border: 1px solid #3b82f6 !important;
-        box-shadow: 0 0 0 1px #3b82f6 !important;
-    }}
-
-    /* Calculator buttons */
-
-    .stButton > button {{
-        background: {button_bg} !important;
-        color: {text_color} !important;
-        border: 1px solid {border_color} !important;
-        border-radius: 13px !important;
-        min-height: 3.4rem;
-        font-weight: 650;
-    }}
-
-    .stButton > button:hover {{
-        border-color: #3b82f6 !important;
-        color: #3b82f6 !important;
-    }}
-
-    /* Equals button */
-
-    .stButton > button[kind="primary"] {{
-        background: #2563eb !important;
-        color: white !important;
-        border-color: #2563eb !important;
-    }}
-
-    /* Scientific functions and history */
-
-    [data-testid="stExpander"] {{
-        background: {panel_bg} !important;
-        border: 1px solid {border_color} !important;
-        border-radius: 12px !important;
-    }}
-
-    [data-testid="stExpander"] summary {{
-        color: {text_color} !important;
-    }}
-
-    /* Appearance selector */
-
-    [data-testid="stSelectbox"] div[data-baseweb="select"] {{
-        background: {panel_bg} !important;
-        color: {text_color} !important;
-        border-color: {border_color} !important;
-    }}
-
-    [data-testid="stSelectbox"] div[data-baseweb="select"] * {{
-        color: {text_color} !important;
-    }}
-
-    /* Result */
-
-    .result-value {{
-        color: {text_color} !important;
-        text-align: right;
-        font-size: 2rem;
-        font-weight: 750;
-    }}
-
-    .result-caption {{
-        color: {muted_color} !important;
-        text-align: right;
-    }}
-
-    /* Mobile */
-
-    @media (max-width: 600px) {{
-        .block-container {{
-            padding: .65rem .55rem 1.25rem;
-        }}
-
-        .stButton > button {{
-            min-height: 3rem;
-            font-size: 1rem;
-        }}
-
-        [data-testid="stTextInput"] input {{
-            font-size: 1.35rem !important;
-        }}
-    }}
-
-    </style>
-    """,
-    unsafe_allow_html=True
+/* ---------- keep the keypad a grid on phones ---------- */
+div[data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
+@media (max-width: 640px) {{
+  div[data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; }}
+  div[data-testid="stColumn"], div[data-testid="column"] {{
+    min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }}
+  .block-container {{ padding: 1rem .6rem 2rem; }}
+  [data-testid="stButton"] button, [data-testid="stFormSubmitButton"] button {{
+    min-height: 3rem; padding: .25rem .1rem; }}
+}}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# if dark:
-
-#     page_bg = "#111827"
-#     panel_bg = "#1f2937"
-#     text_color = "#f9fafb"
-#     muted_color = "#aab4c3"
-#     input_bg = "#111827"
-#     border_color = "#374151"
-#     button_bg = "#374151"
-
-# else:
-
-#     page_bg = "#f7f8fc"
-#     panel_bg = "#ffffff"
-#     text_color = "#172033"
-#     muted_color = "#7b8494"
-#     input_bg = "#ffffff"
-#     border_color = "#e2e6ef"
-#     button_bg = "#ffffff"
-
-
-# # --------------------------------------------------
-# # CUSTOM CSS
-# # --------------------------------------------------
-
-# st.markdown(
-#     f"""
-#     <style>
-
-#     /* Main application */
-
-#     .stApp {{
-#         background-color: {page_bg} !important;
-#         color: {text_color} !important;
-#     }}
-
-#     .block-container {{
-#         max-width: 620px;
-#         padding: 1.25rem 1rem 2rem;
-#     }}
-
-#     /* Calculator heading */
-
-#     .calc-title {{
-#         text-align: center;
-#         font-size: 1.45rem;
-#         font-weight: 750;
-#         color: {text_color};
-#         margin: .1rem 0;
-#     }}
-
-#     .calc-subtitle {{
-#         text-align: center;
-#         color: {muted_color};
-#         font-size: .86rem;
-#         margin-bottom: 1rem;
-#     }}
-
-#     /* Calculator display */
-
-#     [data-testid="stTextInput"] input {{
-#         text-align: right !important;
-#         font-size: 1.7rem !important;
-#         font-weight: 600 !important;
-#         min-height: 4rem;
-#         border-radius: 14px !important;
-#         font-variant-numeric: tabular-nums;
-#         background-color: {input_bg} !important;
-#         color: {text_color} !important;
-#         border-color: {border_color} !important;
-#         caret-color: #3b82f6 !important;
-#     }}
-
-#     [data-testid="stTextInput"] input:focus {{
-#         border-color: #3b82f6 !important;
-#         box-shadow: 0 0 0 1px #3b82f6 !important;
-#     }}
-
-#     /* Buttons */
-
-#     div.stButton > button {{
-#         min-height: 3.45rem;
-#         border-radius: 13px;
-#         font-size: 1.08rem;
-#         font-weight: 650;
-#         border: 1px solid {border_color};
-#         background-color: {button_bg};
-#         color: {text_color};
-#     }}
-
-#     div.stButton > button:hover {{
-#         border-color: #3b82f6;
-#         color: #3b82f6;
-#     }}
-
-#     /* Primary equals button */
-
-#     div.stButton > button[kind="primary"] {{
-#         background-color: #2563eb !important;
-#         color: #ffffff !important;
-#         border-color: #2563eb !important;
-#     }}
-
-#     div.stButton > button[kind="primary"]:hover {{
-#         background-color: #1d4ed8 !important;
-#     }}
-
-#     /* Calculator panel */
-
-#     [data-testid="stVerticalBlockBorderWrapper"] {{
-#         background-color: {panel_bg};
-#         border-color: {border_color};
-#         border-radius: 18px;
-#     }}
-
-#     /* Result */
-
-#     .result-caption {{
-#         color: {muted_color};
-#         font-size: .82rem;
-#         text-align: right;
-#         margin-top: .6rem;
-#     }}
-
-#     .result-value {{
-#         font-size: 2rem;
-#         font-weight: 750;
-#         text-align: right;
-#         color: {text_color};
-#         overflow-wrap: anywhere;
-#     }}
-
-#     /* Selectbox */
-
-#     [data-testid="stSelectbox"] div[data-baseweb="select"] {{
-#         background-color: {panel_bg};
-#         color: {text_color};
-#     }}
-
-#     /* Spacing */
-
-#     div[data-testid="stHorizontalBlock"] {{
-#         gap: .55rem;
-#     }}
-
-#     /* Mobile responsive design */
-
-#     @media (max-width: 600px) {{
-
-#         .block-container {{
-#             padding: .65rem .55rem 1.25rem;
-#         }}
-
-#         div.stButton > button {{
-#             min-height: 3rem;
-#             font-size: 1rem;
-#             padding: .25rem .1rem;
-#         }}
-
-#         [data-testid="stTextInput"] input {{
-#             min-height: 3.5rem;
-#             font-size: 1.35rem !important;
-#         }}
-
-#         .calc-title {{
-#             font-size: 1.25rem;
-#         }}
-
-#     }}
-
-#     </style>
-#     """,
-#     unsafe_allow_html=True
-# )
 
 # --------------------------------------------------
-# CALCULATOR DISPLAY WITH EQUALS BUTTON
+# HEADER
 # --------------------------------------------------
 
-with st.container(border=True):
-
-    st.caption("EXPRESSION")
-
-    display_col, equals_col = st.columns(
-        [4, 1],
-        vertical_alignment="center"
+head_left, head_right = st.columns([3, 2], vertical_alignment="center")
+with head_left:
+    st.markdown(
+        '<div class="calc-title">🧮 Calculator</div>'
+        '<div class="calc-subtitle">Standard • Scientific</div>',
+        unsafe_allow_html=True,
     )
-
-    with display_col:
-
-        st.text_input(
-            "Calculator expression",
-            key="expression",
-            on_change=sanitize_expression,
-            label_visibility="collapsed",
-            placeholder="0",
-            help=(
-                "Enter numbers, operators or supported "
-                "scientific functions."
-            )
-        )
-
-    with equals_col:
-
-        st.button(
-            "=",
-            key="equals_button",
-            type="primary",
-            on_click=run_calculation,
-            use_container_width=True
-        )
-
-    # Error and result display
-
-    if st.session_state.last_error:
-
-        st.error(st.session_state.last_error)
-
-    elif st.session_state.last_result is not None:
-
-        st.caption("RESULT")
-
-        st.markdown(
-            f'<div class="result-value">'
-            f'{format_result(st.session_state.last_result)}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-    else:
-
-        st.markdown(
-            '<div class="result-caption">'
-            'Enter an expression to begin'
-            '</div>',
-            unsafe_allow_html=True
-        )
+with head_right:
+    st.toggle("Dark mode", key="dark")
 
 
 # --------------------------------------------------
-# BASIC CALCULATOR KEYPAD
+# DISPLAY + KEYPAD (one form: Enter key == "=" key)
 # --------------------------------------------------
 
-key_rows = [
-
-    [
-        ("AC", "AC"),
-        ("⌫", "BACK"),
-        ("(", "("),
-        (")", ")")
-    ],
-
-    [
-        ("7", "7"),
-        ("8", "8"),
-        ("9", "9"),
-        ("÷", "/")
-    ],
-
-    [
-        ("4", "4"),
-        ("5", "5"),
-        ("6", "6"),
-        ("×", "*")
-    ],
-
-    [
-        ("1", "1"),
-        ("2", "2"),
-        ("3", "3"),
-        ("−", "-")
-    ],
-
-    [
-        ("0", "0"),
-        (".", "."),
-        ("%", "%"),
-        ("+", "+")
-    ],
-
+KEYPAD = [
+    [("AC", "AC", "fn_ac"), ("⌫", "BACK", "fn_back"), ("(", "(", "fn_lp"), (")", ")", "fn_rp")],
+    [("7", "7", "n7"), ("8", "8", "n8"), ("9", "9", "n9"), ("÷", "÷", "op_div")],
+    [("4", "4", "n4"), ("5", "5", "n5"), ("6", "6", "n6"), ("×", "×", "op_mul")],
+    [("1", "1", "n1"), ("2", "2", "n2"), ("3", "3", "n3"), ("−", "−", "op_sub")],
+    [("0", "0", "n0"), (".", ".", "ndot"), ("%", "%", "op_mod"), ("+", "+", "op_add")],
 ]
 
-for row_index, row in enumerate(key_rows):
-
-    cols = st.columns(4)
-
-    for col, (label, token) in zip(cols, row):
-
-        with col:
-
-            if token == "AC":
-
-                st.button(
-                    label,
-                    key=f"key_{row_index}_{label}",
-                    on_click=clear_all,
-                    use_container_width=True
-                )
-
-            elif token == "BACK":
-
-                st.button(
-                    label,
-                    key=f"key_{row_index}_{label}",
-                    on_click=backspace,
-                    use_container_width=True
-                )
-
-            else:
-
-                st.button(
-                    label,
-                    key=f"key_{row_index}_{label}",
-                    on_click=add_token,
-                    args=(token,),
-                    use_container_width=True
-                )
+SCIENTIFIC = [
+    [("sin", "sin(", "sci_sin"), ("cos", "cos(", "sci_cos"), ("tan", "tan(", "sci_tan")],
+    [("log", "log(", "sci_log"), ("ln", "ln(", "sci_ln"), ("|x|", "abs(", "sci_abs")],
+    [("√", "sqrt(", "sci_sqrt"), ("round", "round(", "sci_round"), (",", ",", "sci_comma")],
+    [("x²", "SQ", "sci_sq"), ("xʸ", "^", "sci_pow"), ("//", "//", "sci_floor")],
+    [("π", "pi", "sci_pi"), ("e", "e", "sci_e"), ("Ans", "ans", "sci_ans")],
+]
 
 
-# --------------------------------------------------
-# SCIENTIFIC CALCULATOR
-# --------------------------------------------------
-
-with st.expander("Scientific Functions", expanded=False):
-
-    sci_rows = [
-
-        [
-            ("sin", "sin("),
-            ("cos", "cos("),
-            ("tan", "tan(")
-        ],
-
-        [
-            ("log", "log("),
-            ("ln", "ln("),
-            ("abs", "abs(")
-        ],
-
-        [
-            ("x²", "SQUARE"),
-            ("√", "SQRT"),
-            ("π", "pi"),
-            ("e", "e")
-        ],
-
-        [
-            ("^", "**"),
-            ("Ans", "ANS")
-        ],
-
-    ]
-
-    for row_index, row in enumerate(sci_rows):
-
-        cols = st.columns(len(row))
-
-        for col, (label, token) in zip(cols, row):
-
-            with col:
-
-                if token == "ANS":
-
-                    st.button(
-                        label,
-                        key=f"sci_{row_index}_{label}",
-                        on_click=insert_answer,
-                        use_container_width=True
-                    )
-
-                elif token == "SQUARE":
-
-                    st.button(
-                        label,
-                        key=f"sci_{row_index}_{label}",
-                        on_click=square_expression,
-                        use_container_width=True
-                    )
-
-                elif token == "SQRT":
-
-                    st.button(
-                        label,
-                        key=f"sci_{row_index}_{label}",
-                        on_click=wrap_sqrt,
-                        use_container_width=True
-                    )
-
-                else:
-
-                    st.button(
-                        label,
-                        key=f"sci_{row_index}_{label}",
-                        on_click=add_token,
-                        args=(token,),
-                        use_container_width=True
-                    )
+def submit_button(label: str, key: str, **kwargs) -> None:
+    """form_submit_button with a fallback for Streamlit versions without `key`."""
+    try:
+        st.form_submit_button(label, key=key, **kwargs, **STRETCH_SUBMIT)
+    except TypeError:
+        st.form_submit_button(label, **kwargs, **STRETCH_SUBMIT)
 
 
-# --------------------------------------------------
-# SUPPORTED OPERATIONS
-# --------------------------------------------------
+def key_button(label: str, token: str, key: str) -> None:
+    submit_button(label, key, on_click=on_key, args=(token,))
+
+
+try:
+    panel = st.container(key="display_panel")
+except TypeError:  # older Streamlit: no container keys, use the built-in border
+    panel = st.container(border=True)
+
+with st.form("calculator", clear_on_submit=False):
+
+    with panel:
+        previous = html.escape(st.session_state.last_expression) or "&nbsp;"
+        st.markdown(f'<div class="calc-prev">{previous}</div>', unsafe_allow_html=True)
+
+        display_col, equals_col = st.columns([4, 1], vertical_alignment="center")
+        with display_col:
+            st.text_input(
+                "Expression",
+                key="expression",
+                label_visibility="collapsed",
+                placeholder="0",
+                max_chars=MAX_EXPRESSION_LENGTH,
+                autocomplete="off",
+            )
+        with equals_col:
+            # Must be the first submit button in the form: Enter triggers it.
+            submit_button("=", "equals", type="primary", on_click=run_calculation)
+
+        notice = st.session_state.notice
+        if notice:
+            (st.error if notice[0] == "error" else st.warning)(notice[1])
+        else:
+            hint = live_preview()
+            st.markdown(
+                f'<div class="calc-preview">{html.escape(hint) or "&nbsp;"}</div>',
+                unsafe_allow_html=True,
+            )
+
+    for row in KEYPAD:
+        for column, (label, token, key) in zip(st.columns(4), row):
+            with column:
+                key_button(label, token, key)
+
+    with st.expander("Scientific functions", expanded=False):
+        for row in SCIENTIFIC:
+            for column, (label, token, key) in zip(st.columns(3), row):
+                with column:
+                    key_button(label, token, key)
 
 st.caption(
-    "Supported: +, −, ×, ÷, %, **, parentheses, "
-    "sqrt(), sin(), cos(), tan(), log(), ln(), "
-    "abs(), pi, e."
+    "Type or tap keys, press Enter or = to calculate. "
+    "Supported: + − × ÷ ^ // % (remainder), brackets, sin, cos, tan (radians), "
+    "log, ln, √, round, |x|, π, e and Ans."
 )
 
 
 # --------------------------------------------------
-# CALCULATION HISTORY
+# HISTORY
 # --------------------------------------------------
 
-with st.expander(
-    f"History ({len(st.session_state.history)})",
-    expanded=False
-):
-
-    if st.session_state.history:
-
-        for item in st.session_state.history:
-
-            st.markdown(
-                f"**{item['expression']} = {item['result']}**"
+with st.expander("History", expanded=False):
+    history = st.session_state.history
+    if not history:
+        st.caption("Your calculations will appear here.")
+    else:
+        st.caption(f"{len(history)} saved. Tap an entry to reuse it.")
+        for index, item in enumerate(history[:20]):
+            st.button(
+                f"{item['expression']} = {item['result']}",
+                key=f"hist_{index}",
+                on_click=load_history,
+                args=(index,),
+                **STRETCH_BUTTON,
             )
 
-            st.caption(item["time"])
-            st.divider()
-
-        # CSV download
-
         buffer = io.StringIO()
-
         writer = csv.DictWriter(
             buffer,
-            fieldnames=[
-                "time",
-                "expression",
-                "result"
-            ]
+            fieldnames=["time", "expression", "result"],
+            extrasaction="ignore",
         )
-
         writer.writeheader()
-        writer.writerows(st.session_state.history)
-
+        writer.writerows(history)
         st.download_button(
-            "Download History as CSV",
+            "Download history as CSV",
             data=buffer.getvalue(),
             file_name="calculator_history.csv",
             mime="text/csv",
-            use_container_width=True
+            **STRETCH_DOWNLOAD,
         )
-
-        st.button(
-            "Clear History",
-            on_click=clear_history,
-            use_container_width=True
-        )
-
-    else:
-
-        st.caption(
-            "Your calculations will appear here."
-        )
-
-
-# --------------------------------------------------
-# SIDEBAR HELP
-# --------------------------------------------------
-
-# with st.sidebar:
-
-#     st.subheader("How to Use")
-
-#     st.write(
-#         "Use the keypad or type an expression "
-#         "in the calculator display."
-#     )
-
-#     st.write("Press = to calculate.")
-
-#     st.write("Examples:")
-
-#     st.code(
-#         "2 + 3 * 4\n"
-#         "(2 + 3) * 4\n"
-#         "sqrt(25)\n"
-#         "sin(30)\n"
-#         "100 / 4 + 6**2"
-#     )
-
-#     st.write(
-#         "Standard mathematical precedence applies. "
-#         "Parentheses can change the calculation order."
-#     )
-# """Responsive calculator app built with Streamlit."""
-# from datetime import datetime
-# import csv
-# import io
-# import re
-
-# import streamlit as st
-# from calculator import CalculatorError, evaluate_expression, format_result
-
-# st.set_page_config(
-#     page_title="Calculator",
-#     page_icon="🧮",
-#     layout="centered",
-#     initial_sidebar_state="collapsed",
-# )
-
-# DEFAULTS = {
-#     "expression": "",
-#     "history": [],
-#     "last_result": None,
-#     "last_error": "",
-#     "just_evaluated": False,
-#     "appearance": "Light",
-# }
-# for key, value in DEFAULTS.items():
-#     if key not in st.session_state:
-#         st.session_state[key] = value
-
-# ALLOWED_NAMES = {"sqrt", "sin", "cos", "tan", "log", "ln", "abs", "pi", "e"}
-
-
-# def sanitize_expression():
-#     """Allow only calculator numbers and operators."""
-#     raw = st.session_state.expression
-
-#     cleaned = re.sub(
-#         r"[^0-9+\-*/().%\s]",
-#         "",
-#         raw
-#     )
-
-#     st.session_state.expression = cleaned
-# # def sanitize_expression():
-# #     """Keep only calculator characters and supported function/constants."""
-# #     raw = st.session_state.expression
-# #     cleaned = re.sub(r"[^0-9A-Za-z+\-*/().%\s]", "", raw)
-# #     cleaned = re.sub(
-# #         r"[A-Za-z]+",
-# #         lambda match: match.group(0) if match.group(0) in ALLOWED_NAMES else "",
-# #         cleaned,
-# #     )
-# #     st.session_state.expression = cleaned
-
-
-# def add_token(token: str):
-#     if st.session_state.just_evaluated and token not in ("+", "-", "*", "/", "%", "**"):
-#         st.session_state.expression = ""
-#     st.session_state.expression += token
-#     st.session_state.just_evaluated = False
-#     st.session_state.last_error = ""
-
-
-# def clear_all():
-#     st.session_state.expression = ""
-#     st.session_state.last_result = None
-#     st.session_state.last_error = ""
-#     st.session_state.just_evaluated = False
-
-
-# def backspace():
-#     st.session_state.expression = st.session_state.expression[:-1]
-#     st.session_state.last_error = ""
-#     st.session_state.just_evaluated = False
-
-
-# def wrap_sqrt():
-#     current = st.session_state.expression.strip()
-#     st.session_state.expression = f"sqrt({current})" if current else "sqrt("
-#     st.session_state.just_evaluated = False
-#     st.session_state.last_error = ""
-
-
-# def square_expression():
-#     current = st.session_state.expression.strip()
-#     if current:
-#         st.session_state.expression = f"({current})**2"
-#     st.session_state.just_evaluated = False
-#     st.session_state.last_error = ""
-
-
-# def insert_answer():
-#     if st.session_state.last_result is not None:
-#         add_token(str(st.session_state.last_result))
-#     else:
-#         st.session_state.last_error = "There is no previous answer yet."
-
-
-# def run_calculation():
-#     expression = st.session_state.expression.strip()
-#     try:
-#         if not expression:
-#             raise CalculatorError("Enter an expression first.")
-#         result = evaluate_expression(expression)
-#         result_text = format_result(result)
-#         st.session_state.last_result = result
-#         st.session_state.last_error = ""
-#         st.session_state.history.insert(0, {
-#             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-#             "expression": expression,
-#             "result": result_text,
-#         })
-#         st.session_state.history = st.session_state.history[:100]
-#         st.session_state.expression = str(result)
-#         st.session_state.just_evaluated = True
-#     except CalculatorError as exc:
-#         st.session_state.last_error = str(exc)
-#         st.session_state.last_result = None
-#         st.session_state.just_evaluated = False
-#     except Exception:
-#         st.session_state.last_error = "Unable to calculate this expression."
-#         st.session_state.last_result = None
-#         st.session_state.just_evaluated = False
-
-
-# def clear_history():
-#     st.session_state.history = []
-
-
-# # Appearance selector
-# head_left, head_right = st.columns([3, 1])
-# with head_left:
-#     st.markdown('<div class="calc-title">🧮 Calculator</div>', unsafe_allow_html=True)
-#     st.markdown(
-#         '<div class="calc-subtitle">Standard • Multi-step expressions</div>',
-#         unsafe_allow_html=True,
-#     )
-# with head_right:
-#     st.selectbox(
-#         "Appearance",
-#         ["Light", "Dark"],
-#         key="appearance",
-#         label_visibility="collapsed",
-#         help="Choose light or dark appearance",
-#     )
-
-# dark = st.session_state.appearance == "Dark"
-# if dark:
-#     page_bg = "#111827"
-#     panel_bg = "#1f2937"
-#     text_color = "#f9fafb"
-#     muted_color = "#aab4c3"
-#     input_bg = "#111827"
-#     border_color = "#374151"
-#     button_bg = "#374151"
-# else:
-#     page_bg = "#f7f8fc"
-#     panel_bg = "#ffffff"
-#     text_color = "#172033"
-#     muted_color = "#7b8494"
-#     input_bg = "#ffffff"
-#     border_color = "#e2e6ef"
-#     button_bg = "#ffffff"
-# # if dark:
-# #     page_bg = "#111827"
-# #     panel_bg = "#1f2937"
-# #     text_color = "#f9fafb"
-# #     muted_color = "#aab4c3"
-# #     input_bg = "#111827"
-# #     border_color = "#374151"
-# # else:
-# #     # pass
-# #     page_bg = "#f7f8fc"
-# #     panel_bg = "#ffffff"
-# #     text_color = "#172033"
-# #     muted_color = "#7b8494"
-# #     input_bg = "#ffffff"
-# #     border_color = "#e2e6ef"
-
-# st.markdown(
-#     f"""
-#     <style>
-#       .stApp {{ background: {page_bg}; color: {text_color}; }}
-#       .block-container {{ max-width: 620px; padding: 1.25rem 1rem 2rem; }}
-#       .calc-title {{ text-align:center; font-size:1.45rem; font-weight:750;
-#                      color:{text_color}; margin:.1rem 0; }}
-#       .calc-subtitle {{ text-align:center; color:{muted_color}; font-size:.86rem;
-#                         margin-bottom:1rem; }}
-#       div[data-testid="stTextInput"] input {{
-#         text-align:right; font-size:1.7rem; font-weight:600; min-height:4rem;
-#         border-radius:14px; font-variant-numeric:tabular-nums;
-#         background:{input_bg}; color:{text_color}; border_color:{border_color};
-#         caret-color:#3b82f6;
-#       }}
-#       div.stButton > button {{
-#         min-height:3.45rem; border-radius:13px; font-size:1.08rem;
-#         font-weight:650; border:1px solid {border_color};
-#       }}
-#       div[data-testid="stHorizontalBlock"] {{ gap:.55rem; }}
-#       .result-caption {{ color:{muted_color}; font-size:.82rem;
-#                          text-align:right; margin-top:.6rem; }}
-#       .result-value {{ font-size:2rem; font-weight:750; text-align:right;
-#                        color:{text_color}; overflow-wrap:anywhere; }}
-#       div[data-testid="stVerticalBlockBorderWrapper"] {{
-#         background:{panel_bg}; border-color:{border_color};
-#         border-radius:18px;
-#       }}
-#       @media (max-width: 600px) {{
-#         .block-container {{ padding:.65rem .55rem 1.25rem; }}
-#         div.stButton > button {{ min-height:3rem; font-size:1rem;
-#                                  padding:.25rem .1rem; }}
-#         div[data-testid="stTextInput"] input {{ min-height:3.5rem;
-#                                                font-size:1.45rem; }}
-#         .calc-title {{ font-size:1.25rem; }}
-#       }}
-#     </style>
-#     """,
-#     unsafe_allow_html=True,
-# )
-
-# with st.container(border=True):
-#     st.caption("EXPRESSION")
-#     st.text_input(
-#         "Calculator expression",
-#         key="expression",
-#         on_change=sanitize_expression,
-#         label_visibility="collapsed",
-#         placeholder="0",
-#         help=(
-#             "Enter numbers, operators, parentheses, or supported functions. "
-#             "Unsupported characters are removed."
-#         ),
-#     )
-#     if st.session_state.last_error:
-#         st.error(st.session_state.last_error)
-#     elif st.session_state.last_result is not None:
-#         st.caption("RESULT")
-#         st.markdown(
-#             f'<div class="result-value">{format_result(st.session_state.last_result)}</div>',
-#             unsafe_allow_html=True,
-#         )
-#     else:
-#         st.markdown(
-#             '<div class="result-caption">Enter an expression to begin</div>',
-#             unsafe_allow_html=True,
-#         )
-
-# # The equals key is in the conventional bottom-right keypad position.
-# key_rows = [
-#     [("AC", "AC"), ("⌫", "BACK"), ("(", "("), (")", ")")],
-#     [("7", "7"), ("8", "8"), ("9", "9"), ("÷", "/")],
-#     [("4", "4"), ("5", "5"), ("6", "6"), ("×", "*")],
-#     [("1", "1"), ("2", "2"), ("3", "3"), ("−", "-")],
-#     [("0", "0"), (".", "."), ("%", "%"), ("+", "+")],
-# ]
-# for row_index, row in enumerate(key_rows):
-#     cols = st.columns(4)
-#     for col, (label, token) in zip(cols, row):
-#         with col:
-#             if token == "AC":
-#                 st.button(label, key=f"key_{row_index}_{label}",
-#                           on_click=clear_all, use_container_width=True)
-#             elif token == "BACK":
-#                 st.button(label, key=f"key_{row_index}_{label}",
-#                           on_click=backspace, use_container_width=True)
-#             else:
-#                 st.button(label, key=f"key_{row_index}_{label}",
-#                           on_click=add_token, args=(token,),
-#                           use_container_width=True)
-
-# # Scientific keys
-# with st.expander("Scientific functions"):
-#     sci_rows = [
-#         [("sin", "sin("), ("cos", "cos("), ("tan", "tan(")],
-#         [("log", "log("), ("ln", "ln("), ("abs", "abs(")],
-#         [("x²", "SQUARE"), ("√", "SQRT"), ("π", "pi"), ("e", "e")],
-#         [("^", "**"), ("Ans", "ANS")],
-#     ]
-#     for row_index, row in enumerate(sci_rows):
-#         cols = st.columns(len(row))
-#         for col, (label, token) in zip(cols, row):
-#             with col:
-#                 if token == "ANS":
-#                     st.button(label, key=f"sci_{row_index}_{label}",
-#                               on_click=insert_answer, use_container_width=True)
-#                 elif token == "SQUARE":
-#                     st.button(label, key=f"sci_{row_index}_{label}",
-#                               on_click=square_expression, use_container_width=True)
-#                 elif token == "SQRT":
-#                     st.button(label, key=f"sci_{row_index}_{label}",
-#                               on_click=wrap_sqrt, use_container_width=True)
-#                 else:
-#                     st.button(label, key=f"sci_{row_index}_{label}",
-#                               on_click=add_token, args=(token,),
-#                               use_container_width=True)
-
-# # Equals occupies the bottom-right position, like a desktop calculator.
-# equals_cols = st.columns(4)
-# with equals_cols[3]:
-#     st.button("=", type="primary", on_click=run_calculation,
-#               use_container_width=True)
-
-# st.caption(
-#     "Supported: +, −, ×, ÷, %, **, parentheses, sqrt(), sin(), cos(), "
-#     "tan(), log(), ln(), abs(), pi, e."
-# )
-
-# with st.expander(f"History ({len(st.session_state.history)})", expanded=False):
-#     if st.session_state.history:
-#         for item in st.session_state.history:
-#             st.markdown(f"**{item['expression']} = {item['result']}**")
-#             st.caption(item["time"])
-#             st.divider()
-#         buffer = io.StringIO()
-#         writer = csv.DictWriter(buffer, fieldnames=["time", "expression", "result"])
-#         writer.writeheader()
-#         writer.writerows(st.session_state.history)
-#         st.download_button(
-#             "Download history as CSV",
-#             data=buffer.getvalue(),
-#             file_name="calculator_history.csv",
-#             mime="text/csv",
-#             use_container_width=True,
-#         )
-#         st.button("Clear history", on_click=clear_history, use_container_width=True)
-#     else:
-#         st.caption("Your calculations will appear here.")
-
-# with st.sidebar:
-#     st.subheader("How to use")
-#     st.write("Use the keypad or type an expression in the display. Press **=** to calculate.")
-#     st.write("Examples:")
-#     st.code("2 + 3 * 4\n(2 + 3) * 4\n100 / 4 + 6**2")
-#     st.write(
-#         "Standard precedence applies: multiplication and division happen before "
-#         "addition and subtraction, unless parentheses change the order."
-#     )
+        st.button("Clear history", on_click=clear_history, **STRETCH_BUTTON)
