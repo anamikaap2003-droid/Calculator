@@ -66,6 +66,85 @@ def _stretch(widget) -> dict:
     return {"width": "stretch"} if "width" in params else {"use_container_width": True}
 
 
+try:
+    from streamlit.components.v1 import html as _components_html
+except Exception:  # pragma: no cover
+    _components_html = None
+
+# Runs in the browser. Streamlit cannot filter keystrokes or keep focus by
+# itself, so this small script (a) blocks every typed or pasted character that
+# is not a digit, operator, bracket, dot or comma, and (b) puts the cursor back
+# in the display after every rerun and after clicking anywhere on the page.
+_INPUT_GUARD_JS = """
+<script>
+(function () {
+  try {
+    var doc = window.parent.document;
+    var ALLOWED = /^[0-9+\\-*\\/^%().,\\s\\u00d7\\u00f7\\u2212]*$/;
+    var BAD = /[^0-9+\\-*\\/^%().,\\s\\u00d7\\u00f7\\u2212]/g;
+    var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+
+    function find() { return doc.querySelector('input[aria-label="Expression"]'); }
+    function focusEnd(input) {
+      input.focus({ preventScroll: true });
+      var n = input.value.length;
+      try { input.setSelectionRange(n, n); } catch (e) {}
+    }
+    function attach(input) {
+      if (input.dataset.calcGuard) return;
+      input.dataset.calcGuard = '1';
+      input.addEventListener('keydown', function (e) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key && e.key.length === 1 && !ALLOWED.test(e.key)) e.preventDefault();
+      });
+      input.addEventListener('beforeinput', function (e) {
+        if (e.data && !ALLOWED.test(e.data)) e.preventDefault();
+      });
+      input.addEventListener('paste', function (e) {
+        e.preventDefault();
+        var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(BAD, '');
+        if (!text) return;
+        input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      input.addEventListener('drop', function (e) { e.preventDefault(); });
+    }
+    function ready() {
+      var input = find();
+      if (!input) return;
+      attach(input);
+      if (coarse) input.setAttribute('inputmode', 'none');  // phones: use the keypad
+      if (doc.activeElement !== input) focusEnd(input);
+    }
+
+    // Clicking anywhere that is not another field returns the cursor to the display.
+    if (!window.parent.__calcFocusClick) {
+      window.parent.__calcFocusClick = true;
+      doc.addEventListener('click', function (e) {
+        if (e.target.closest && e.target.closest('input, textarea, select, a, summary')) return;
+        var input = find();
+        if (input) setTimeout(function () { focusEnd(input); }, 0);
+      });
+    }
+
+    // Streamlit may finish drawing after this script runs, so retry briefly.
+    [0, 60, 200, 500].forEach(function (d) { setTimeout(ready, d); });
+  } catch (err) {}
+})();
+</script>
+"""
+
+
+def keep_input_ready() -> None:
+    """Re-run the guard script after every rerun (the nonce forces a reload)."""
+    if _components_html is None:
+        return
+    try:
+        _components_html(f"<!-- {datetime.now().timestamp()} -->{_INPUT_GUARD_JS}", height=0)
+    except Exception:
+        pass
+
+
 STRETCH_SUBMIT = _stretch(st.form_submit_button)
 STRETCH_BUTTON = _stretch(st.button)
 STRETCH_DOWNLOAD = _stretch(st.download_button)
@@ -432,6 +511,10 @@ button[data-testid="stBaseButton-primaryFormSubmit"]:hover {{
 [data-testid="stExpander"] summary, [data-testid="stExpander"] summary * {{
   color: var(--text) !important; }}
 
+/* ---------- hide the zero-height helper iframe ---------- */
+div[data-testid="stElementContainer"]:has(iframe[height="0"]) {{
+  position: absolute; height: 0; margin: 0; padding: 0; overflow: hidden; }}
+
 /* ---------- keep the keypad a grid on phones ---------- */
 div[data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
 @media (max-width: 640px) {{
@@ -496,14 +579,17 @@ def key_button(label: str, token: str, key: str) -> None:
     submit_button(label, key, on_click=on_key, args=(token,))
 
 
-try:
-    panel = st.container(key="display_panel")
-except TypeError:  # older Streamlit: no container keys, use the built-in border
-    panel = st.container(border=True)
+def display_panel():
+    """Styled panel. Must be created inside the form so its buttons belong to it."""
+    try:
+        return st.container(key="display_panel")
+    except TypeError:  # older Streamlit: no container keys, use the built-in border
+        return st.container(border=True)
+
 
 with st.form("calculator", clear_on_submit=False):
 
-    with panel:
+    with display_panel():
         previous = html.escape(st.session_state.last_expression) or "&nbsp;"
         st.markdown(f'<div class="calc-prev">{previous}</div>', unsafe_allow_html=True)
 
@@ -542,10 +628,12 @@ with st.form("calculator", clear_on_submit=False):
                 with column:
                     key_button(label, token, key)
 
+keep_input_ready()
+
 st.caption(
-    "Type or tap keys, press Enter or = to calculate. "
-    "Supported: + − × ÷ ^ // % (remainder), brackets, sin, cos, tan (radians), "
-    "log, ln, √, round, |x|, π, e and Ans."
+    "Type numbers and operators or tap keys, press Enter or = to calculate. "
+    "Functions (sin, cos, tan, log, ln, √, round, |x|, π, e, Ans) come from the "
+    "Scientific keys. Supported: + − × ÷ ^ // % (remainder) and brackets."
 )
 
 
