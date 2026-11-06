@@ -10,6 +10,7 @@ import csv
 import html
 import inspect
 import io
+import json
 import re
 from datetime import datetime
 
@@ -72,75 +73,114 @@ except Exception:  # pragma: no cover
     _components_html = None
 
 # Runs in the browser. Streamlit cannot filter keystrokes or keep focus by
-# itself, so this small script (a) blocks every typed or pasted character that
-# is not a digit, operator, bracket, dot or comma, and (b) puts the cursor back
-# in the display after every rerun and after clicking anywhere on the page.
-_INPUT_GUARD_JS = """
-<script>
+# itself, so a small script is installed ONCE into the page (not into the input
+# element, which Streamlit may replace after a rerun). It
+#   (a) blocks every typed or pasted character that is not a digit, operator,
+#       bracket, dot or comma (event delegation, so it survives re-renders),
+#   (b) cleans the value as a safety net for keyboards that skip key events,
+#   (c) puts the cursor back in the display after every rerun and click.
+_PAGE_GUARD_JS = r"""
 (function () {
-  try {
-    var doc = window.parent.document;
-    var ALLOWED = /^[0-9+\\-*\\/^%().,\\s\\u00d7\\u00f7\\u2212]*$/;
-    var BAD = /[^0-9+\\-*\\/^%().,\\s\\u00d7\\u00f7\\u2212]/g;
-    var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  if (window.__calcGuard) return;
+  var doc = document;
+  var SEL = 'input[aria-label="Expression"]';
+  var OKCH = /^[0-9+\-*\/^%().,\s×÷−]*$/;
+  var NOTOK = /[^0-9+\-*\/^%().,\s×÷−]/g;
+  var BADCH = /[^A-Za-z0-9+\-*\/^%().,\s×÷−]/g;
+  var WORDS = {sin:1, cos:1, tan:1, log:1, ln:1, sqrt:1, abs:1, round:1, pi:1, e:1, ans:1};
+  var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 
-    function find() { return doc.querySelector('input[aria-label="Expression"]'); }
-    function focusEnd(input) {
-      input.focus({ preventScroll: true });
-      var n = input.value.length;
-      try { input.setSelectionRange(n, n); } catch (e) {}
-    }
-    function attach(input) {
-      if (input.dataset.calcGuard) return;
-      input.dataset.calcGuard = '1';
-      input.addEventListener('keydown', function (e) {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        if (e.key && e.key.length === 1 && !ALLOWED.test(e.key)) e.preventDefault();
-      });
-      input.addEventListener('beforeinput', function (e) {
-        if (e.data && !ALLOWED.test(e.data)) e.preventDefault();
-      });
-      input.addEventListener('paste', function (e) {
-        e.preventDefault();
-        var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(BAD, '');
-        if (!text) return;
-        input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      });
-      input.addEventListener('drop', function (e) { e.preventDefault(); });
-    }
-    function ready() {
+  function find() { return doc.querySelector(SEL); }
+  function isCalc(el) { return !!(el && el.matches && el.matches(SEL)); }
+  function focusEnd(input) {
+    input.focus({ preventScroll: true });
+    var n = input.value.length;
+    try { input.setSelectionRange(n, n); } catch (e) {}
+  }
+
+  doc.addEventListener('keydown', function (e) {
+    if (!isCalc(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key && e.key.length === 1 && !OKCH.test(e.key)) e.preventDefault();
+  }, true);
+
+  doc.addEventListener('beforeinput', function (e) {
+    if (isCalc(e.target) && e.data && !OKCH.test(e.data)) e.preventDefault();
+  }, true);
+
+  doc.addEventListener('paste', function (e) {
+    var input = e.target;
+    if (!isCalc(input)) return;
+    e.preventDefault();
+    var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(NOTOK, '');
+    if (!text) return;
+    input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }, true);
+
+  doc.addEventListener('drop', function (e) {
+    if (isCalc(e.target)) e.preventDefault();
+  }, true);
+
+  // Safety net: any user-originated change is cleaned. Keypad-inserted text such
+  // as "sin(" never fires an input event, and whole function names are kept.
+  doc.addEventListener('input', function (e) {
+    var input = e.target;
+    if (!isCalc(input)) return;
+    var v = input.value;
+    var c = v.replace(BADCH, '').replace(/[A-Za-z]+/g, function (w) {
+      return WORDS[w.toLowerCase()] ? w : '';
+    });
+    if (c === v) return;
+    var pos = Math.max((input.selectionStart || 0) - (v.length - c.length), 0);
+    setter.call(input, c);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    try { input.setSelectionRange(pos, pos); } catch (err) {}
+  }, true);
+
+  // Clicking anywhere that is not another field returns the cursor to the display.
+  doc.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('input, textarea, select, a, summary')) return;
+    var input = find();
+    if (input) setTimeout(function () { focusEnd(input); }, 0);
+  });
+
+  // Phones: use the keypad instead of the on-screen keyboard.
+  if (coarse) {
+    new MutationObserver(function () {
       var input = find();
-      if (!input) return;
-      attach(input);
-      if (coarse) input.setAttribute('inputmode', 'none');  // phones: use the keypad
-      if (doc.activeElement !== input) focusEnd(input);
-    }
+      if (input && input.getAttribute('inputmode') !== 'none') input.setAttribute('inputmode', 'none');
+    }).observe(doc.body, { childList: true, subtree: true });
+  }
 
-    // Clicking anywhere that is not another field returns the cursor to the display.
-    if (!window.parent.__calcFocusClick) {
-      window.parent.__calcFocusClick = true;
-      doc.addEventListener('click', function (e) {
-        if (e.target.closest && e.target.closest('input, textarea, select, a, summary')) return;
-        var input = find();
-        if (input) setTimeout(function () { focusEnd(input); }, 0);
-      });
-    }
-
-    // Streamlit may finish drawing after this script runs, so retry briefly.
-    [0, 60, 200, 500].forEach(function (d) { setTimeout(ready, d); });
-  } catch (err) {}
+  window.__calcReady = function () {
+    var input = find();
+    if (!input) return;
+    if (coarse) input.setAttribute('inputmode', 'none');
+    if (doc.activeElement !== input) focusEnd(input);
+  };
+  window.__calcGuard = true;
 })();
-</script>
 """
+
+_IFRAME_JS = (
+    "<script>(function () { try {"
+    " var p = window.parent, d = p.document;"
+    " if (!p.__calcGuard) {"
+    "   var s = d.createElement('script'); s.textContent = " + json.dumps(_PAGE_GUARD_JS) + ";"
+    "   d.head.appendChild(s); }"
+    " [0, 60, 200, 500].forEach(function (t) {"
+    "   setTimeout(function () { if (p.__calcReady) p.__calcReady(); }, t); });"
+    " } catch (err) {} })();</script>"
+)
 
 
 def keep_input_ready() -> None:
-    """Re-run the guard script after every rerun (the nonce forces a reload)."""
+    """Install the page guard once and refocus after every rerun (nonce forces reload)."""
     if _components_html is None:
         return
     try:
-        _components_html(f"<!-- {datetime.now().timestamp()} -->{_INPUT_GUARD_JS}", height=0)
+        _components_html(f"<!-- {datetime.now().timestamp()} -->{_IFRAME_JS}", height=0)
     except Exception:
         pass
 
@@ -441,7 +481,8 @@ html, body, .stApp,
 [data-testid="stHeader"] {{ color: var(--text) !important; }}
 .stApp, .stApp p, .stApp label, .stApp li,
 .stApp h1, .stApp h2, .stApp h3 {{ color: var(--text); }}
-.block-container {{ max-width: 600px; padding: 2rem 1rem 3rem; }}
+.block-container, [data-testid="stMainBlockContainer"] {{
+  max-width: 600px; padding: 4.5rem 1rem 3rem !important; }}
 [data-testid="stCaptionContainer"],
 [data-testid="stCaptionContainer"] * {{ color: var(--muted) !important; }}
 
@@ -521,7 +562,8 @@ div[data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
   div[data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; }}
   div[data-testid="stColumn"], div[data-testid="column"] {{
     min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }}
-  .block-container {{ padding: 1rem .6rem 2rem; }}
+  .block-container, [data-testid="stMainBlockContainer"] {{
+    padding: 4rem .6rem 2rem !important; }}
   [data-testid="stButton"] button, [data-testid="stFormSubmitButton"] button {{
     min-height: 3rem; padding: .25rem .1rem; }}
 }}
@@ -535,7 +577,7 @@ div[data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
 # HEADER
 # --------------------------------------------------
 
-head_left, head_right = st.columns([2, 2], vertical_alignment="center")
+head_left, head_right = st.columns([3, 2], vertical_alignment="center")
 with head_left:
     st.markdown(
         '<div class="calc-title">🧮 Calculator</div>'
