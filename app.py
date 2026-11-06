@@ -535,7 +535,7 @@ div[data-testid="stHorizontalBlock"] {{ gap: .5rem; }}
 # HEADER
 # --------------------------------------------------
 
-head_left, head_right = st.columns([3, 2], vertical_alignment="center")
+head_left, head_right = st.columns([3, 3], vertical_alignment="center")
 with head_left:
     st.markdown(
         '<div class="calc-title">🧮 Calculator</div>'
